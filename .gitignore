@@ -1,0 +1,7 @@
+# Written by the engine beside the mod when it loads; not part of the source.
+.claude-plugin/types/
+tsconfig.json
+
+# Python cache from running the tokens script.
+__pycache__/
+*.pyc
