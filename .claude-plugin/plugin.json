@@ -1,0 +1,1 @@
+{ "name": "token-meter", "version": "1.0.0", "author": { "name": "ethicalsumit" }, "license": "MIT", "description": "Shows the current chat's token usage with /tokens" }
