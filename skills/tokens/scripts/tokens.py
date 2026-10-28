@@ -178,6 +178,11 @@ def preview(content, size=42):
     if isinstance(content, list):
         content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
     text = NOTE_RE.sub(" ", content if isinstance(content, str) else "")
+    command = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+    if command:  # a slash command: show it as typed, not its markup
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        text = command.group(1) + " " + (args.group(1) if args else "")
+    text = re.sub(r"^\s*/[\w-]+:([\w-]+)", r"/\1", text)  # /plugin:command -> /command
     text = re.sub(r"<[^>]*>", " ", text)
     text = re.sub(r"(?i)\b(?:javascript|vbscript|data|file):", " ", text)
     text = re.sub(r"(?i)\b(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|net|org|io|ai|dev|app|co|fi|in|example)\b\S*", "[link]", text)
