@@ -237,7 +237,7 @@ class Stats:
         self.tool_names = {}   # tool_use id -> tool name, to label tool results
         self.parts = {}        # context category -> estimated tokens (main thread, since any compaction)
         self.items = []        # (label, estimated tokens) of single large context items
-        self.first_ctx = None  # context of the first main-thread call
+        self.first_key = None  # the first main-thread call
         self.parts_at_first = None
         self.cards = 0         # cards drawn with the visual tool in this chat
 
@@ -300,8 +300,8 @@ class Stats:
                 usage = clean_usage(usage)
                 if key not in self.calls:
                     self.call_time[key] = parse_time(row.get("timestamp"))
-                    if main and not row.get("isSidechain") and self.first_ctx is None:
-                        self.first_ctx = context_of(usage)
+                    if main and not row.get("isSidechain") and self.first_key is None:
+                        self.first_key = key
                         self.parts_at_first = sum(self.parts.values())
                 self.calls[key] = usage
                 self.models[key] = str(msg.get("model") or "")
@@ -685,7 +685,10 @@ def history(st):
 
 def setup_size(st, ctx):
     """Tokens the chat starts with before any message: the first call's context less what came before it."""
-    return min(max(0, (st.first_ctx or 0) - (st.parts_at_first or 0)), ctx or 0)
+    # A call can be written several times while it streams; its last copy has the full usage.
+    first = st.calls.get(st.first_key)
+    first_ctx = context_of(first) if first else 0
+    return min(max(0, first_ctx - (st.parts_at_first or 0)), ctx or 0)
 
 
 def composition(st, ctx):
