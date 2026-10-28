@@ -33,7 +33,7 @@ It reads the usage the API reported for every model call in the chat (main threa
 
 - Claude only: claude.ai (web, desktop and mobile) or Claude Code. It reads Claude's own session transcript, so it does not work with other assistants or with apps built directly on the API.
 - The chat must let Claude run code, since the command runs a small Python script.
-- Not counted: background calls the app makes outside the chat transcript. In claude.ai the first message of a chat can be missing from `/tokens history` and from Last message, though its tokens are counted in the totals.
+- Not counted: background calls the app makes outside the chat transcript.
 
 ## Install
 
