@@ -11,8 +11,14 @@ Usage:
   tokens.py detailed   the detailed card (HTML), for /tokens
   tokens.py summary    the summary card (HTML), for /tokens summary
   tokens.py lite       the summary as Markdown text, for /tokens lite (also the default)
+  tokens.py history    what each of the last 10 messages cost
+  tokens.py where      what fills the context every call re-reads
+  tokens.py health     how heavy the chat is, and the cache timer
+  tokens.py tips       ways to spend less, from this chat's numbers
+  tokens.py compare    this chat priced on other models
   tokens.py help       the help text
 """
+import base64
 import glob
 import html
 import json
@@ -32,6 +38,12 @@ HELP = "\n".join([
     "| `/tokens` | the detailed view |",
     "| `/tokens summary` | a short summary |",
     "| `/tokens lite` | a text-only view, the cheapest to run |",
+    "| `/tokens history` | what each of your last 10 messages cost |",
+    "| `/tokens where` | what fills the context that every call re-reads |",
+    "| `/tokens health` | how heavy the chat has become, and the cache timer |",
+    "| `/tokens tips` | ways to spend less, from this chat's own numbers |",
+    "| `/tokens compare` | what this chat would cost on other models |",
+    "| `/tokens handoff` | a short note to carry this work into a new chat |",
     "| `/tokens help` | this help |",
     "",
     "Effective tokens weight cache reads at ×0.1, cache writes at ×2 and output at ×5.",
@@ -111,6 +123,75 @@ def clean_usage(u):
     return out
 
 
+NOTE_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def est_chars(n):
+    """Rough token count for n characters of text (about 3.6 characters per token)."""
+    return int(n / 3.6) if n > 0 else 0
+
+
+def est_text(text):
+    return est_chars(len(text)) if isinstance(text, str) else 0
+
+
+def image_tokens(source):
+    """Tokens an image costs, from its pixel size (width x height / 750, at most about 1,600)."""
+    cap = 1600
+    if not isinstance(source, dict) or not isinstance(source.get("data"), str):
+        return cap
+    try:
+        raw = base64.b64decode(source["data"][:400_000], validate=False)
+    except (ValueError, TypeError):
+        return cap
+    w = h = 0
+    if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+        w, h = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    elif raw[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(raw):
+            if raw[i] != 0xFF:
+                i += 1
+                continue
+            marker = raw[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2):
+                h, w = int.from_bytes(raw[i + 5:i + 7], "big"), int.from_bytes(raw[i + 7:i + 9], "big")
+                break
+            i += 2 + int.from_bytes(raw[i + 2:i + 4], "big")
+    if w <= 0 or h <= 0:
+        return cap
+    return max(1, min(cap, int(w * h / 750)))
+
+
+def parse_time(ts):
+    if not isinstance(ts, str):
+        return None
+    try:
+        when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def preview(content, size=42):
+    """A short, inert preview of a message: no app notes, no Markdown, links or HTML."""
+    if isinstance(content, list):
+        content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+    text = NOTE_RE.sub(" ", content if isinstance(content, str) else "")
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"(?i)\b(?:javascript|vbscript|data|file):", " ", text)
+    text = re.sub(r"(?i)\b(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|net|org|io|ai|dev|app|co|fi|in|example)\b\S*", "[link]", text)
+    text = re.sub(r"[^\w\s/.,:?!'()@#%+=\[\]-]", " ", text, flags=re.U).replace("[", "").replace("]", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "(attachment or empty)"
+    return text if len(text) <= size else text[:size - 1].rstrip() + "…"
+
+
+def context_of(u):
+    return u["input_tokens"] + u["cache_read_input_tokens"] + u["cache_creation_input_tokens"]
+
+
 def is_prompt(row, msg):
     """A message the person sent, as opposed to a tool result or a system note."""
     if row.get("type") != "user" or row.get("isMeta") or row.get("isSidechain"):
@@ -151,6 +232,14 @@ class Stats:
         self.turn = 0          # number of messages the person has sent so far
         self.turn_of = {}      # model call -> the message it answered
         self.models = {}       # model call -> the model that answered it
+        self.call_time = {}    # model call -> when it was answered
+        self.prompts = []      # (preview, time) of each message the person sent
+        self.tool_names = {}   # tool_use id -> tool name, to label tool results
+        self.parts = {}        # context category -> estimated tokens (main thread, since any compaction)
+        self.items = []        # (label, estimated tokens) of single large context items
+        self.first_ctx = None  # context of the first main-thread call
+        self.parts_at_first = None
+        self.cards = 0         # cards drawn with the visual tool in this chat
 
     def read(self, path, main=False):
         try:
@@ -187,13 +276,21 @@ class Stats:
                 msg = row.get("message")
                 if not isinstance(msg, dict):
                     continue
+                if main and row.get("subtype") == "compact_boundary":
+                    self.parts, self.items = {}, []
                 if main and is_prompt(row, msg):
                     self.turn += 1
+                    self.prompts.append((preview(msg.get("content")), parse_time(row.get("timestamp"))))
+                if main and not row.get("isSidechain"):
+                    self.add_context(row, msg)
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_use":
-                            self.tools[str(block.get("id") or id(block))] = str(block.get("name") or "tool")
+                            tid = str(block.get("id") or id(block))
+                            if tid not in self.tools and str(block.get("name") or "").endswith("show_widget"):
+                                self.cards += 1
+                            self.tools[tid] = str(block.get("name") or "tool")
                 usage = msg.get("usage")
                 if not isinstance(usage, dict):
                     continue
@@ -201,11 +298,66 @@ class Stats:
                 # block), each repeating the same usage: count it once.
                 key = str(msg.get("id") or row.get("uuid") or len(self.calls))
                 usage = clean_usage(usage)
+                if key not in self.calls:
+                    self.call_time[key] = parse_time(row.get("timestamp"))
+                    if main and not row.get("isSidechain") and self.first_ctx is None:
+                        self.first_ctx = context_of(usage)
+                        self.parts_at_first = sum(self.parts.values())
                 self.calls[key] = usage
                 self.models[key] = str(msg.get("model") or "")
                 self.turn_of.setdefault(key, self.turn)
                 if not row.get("isSidechain"):
                     self.last = usage
+
+    def add_context(self, row, msg):
+        """Estimate how much each kind of content adds to the context the next calls re-read."""
+        role = msg.get("role") or row.get("type")
+        content = msg.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        if not isinstance(blocks, list):
+            return
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            kind = b.get("type")
+            if role == "assistant":
+                if kind == "tool_use":
+                    self.tool_names[str(b.get("id"))] = str(b.get("name") or "tool")
+                    self.add("Claude's replies and tool calls", est_text(json.dumps(b.get("input"), ensure_ascii=False)))
+                elif kind == "text":
+                    self.add("Claude's replies and tool calls", est_text(b.get("text")))
+            elif kind == "text":
+                text = str(b.get("text") or "")
+                if row.get("isMeta") and "Base directory for this skill" in text:
+                    self.add("Skill instructions", est_text(text))
+                    continue
+                notes = sum(len(m) for m in NOTE_RE.findall(text))
+                self.add("App and system notes", est_chars(notes))
+                self.add("App and system notes" if row.get("isMeta") else "Your messages",
+                         est_chars(len(text) - notes))
+            elif kind == "image":
+                self.add("Images you attached", image_tokens(b.get("source")))
+            elif kind == "tool_result":
+                name = tool_label(self.tool_names.get(str(b.get("tool_use_id")), "tool"))
+                inner = b.get("content")
+                inner = [{"type": "text", "text": inner}] if isinstance(inner, str) else inner
+                if not isinstance(inner, list):
+                    continue
+                for ib in inner:
+                    if not isinstance(ib, dict):
+                        continue
+                    if ib.get("type") == "image":
+                        n = image_tokens(ib.get("source"))
+                        self.add("Screenshots and images from tools", n)
+                        self.items.append((f"Screenshot or image from {name}", n))
+                    elif ib.get("type") == "text":
+                        n = est_text(ib.get("text"))
+                        self.add(f"Tool output: {name}", n)
+                        self.items.append((f"Output of {name}", n))
+
+    def add(self, category, n):
+        if n > 0:
+            self.parts[category] = self.parts.get(category, 0) + n
 
 
 # API list prices in USD per million tokens:
@@ -253,18 +405,24 @@ def call_cost(model, u):
     return (plain * p_in + w5m * p_w5 + w1h * p_w1h + read * p_read + out * p_out) / 1_000_000
 
 
+def priced(st, key, u):
+    """One call's cost: list price for its model, else the session's own cost rate.
+    0 for a call with no tokens; None when there is no way to price it."""
+    c = call_cost(st.models.get(key, ""), u)
+    if c is not None:
+        return c
+    if not effective_of(u):
+        return 0.0
+    return effective_of(u) * st.cost if st.cost is not None else None
+
+
 def api_cost(st):
-    """The chat's cost at API list prices. A call from a model not in the table is priced at
-    the session's own cost snapshot rate when there is one; without it the cost is unknown."""
+    """The chat's cost at API list prices, or None when some call cannot be priced."""
     total = 0.0
     for key, u in st.calls.items():
-        c = call_cost(st.models.get(key, ""), u)
+        c = priced(st, key, u)
         if c is None:
-            if not effective_of(u):
-                continue
-            if st.cost is None:
-                return None
-            c = effective_of(u) * st.cost
+            return None
         total += c
     return total
 
@@ -446,12 +604,250 @@ def lite(st, rows, effective, ctx):
         tail.append(f"📚 Context **{fmt(ctx)}**")
     if tail:
         lines += ["", "  ·  ".join(tail)]
+    if ctx:
+        level, label, _, _ = health_info(st, ctx)
+        lines += ["", f"{level} {label}  ·  more: `/tokens history`, `where`, `health`, `tips`, `compare`"]
+    return "\n".join(lines)
+
+
+# ---- Insight views (Markdown text) --------------------------------------------------
+
+MODEL_NAMES = {
+    "fable-5-1": "Fable 5.1", "mythos-5-1": "Mythos 5.1", "opus-5-5": "Opus 5.5", "sonnet-5-5": "Sonnet 5.5",
+    "haiku-5-5": "Haiku 5.5", "opus-5": "Opus 5", "sonnet-5": "Sonnet 5", "opus-4-8": "Opus 4.8",
+    "sonnet-4-6": "Sonnet 4.6", "haiku-4-5": "Haiku 4.5",
+}
+
+
+def model_key(model):
+    return re.sub(r"-\d{8}$", "", re.sub(r"^claude-", "", str(model).lower()))
+
+
+def main_model(st):
+    counts = {}
+    for key in st.calls:
+        k = model_key(st.models.get(key, ""))
+        if k in PRICES:
+            counts[k] = counts.get(k, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def ago(when, now):
+    if when is None:
+        return ""
+    sec = max(0, int((now - when).total_seconds()))
+    if sec < 60:
+        return "just now"
+    if sec < 3600:
+        return f"{sec // 60}m ago"
+    if sec < 86400:
+        return f"{sec // 3600}h ago"
+    return f"{sec // 86400}d ago"
+
+
+def money(x):
+    return f"${x:.2f}" if x >= 0.01 else "<$0.01"
+
+
+def turn_totals(st):
+    """Per finished message: (calls, effective tokens, cost or None). The running /tokens message is left out."""
+    out = {}
+    for key, u in st.calls.items():
+        t = st.turn_of.get(key, 0)
+        if t < 1 or t >= st.turn:
+            continue
+        calls, eff, cost = out.get(t, (0, 0.0, 0.0))
+        c = priced(st, key, u)
+        out[t] = (calls + 1, eff + effective_of(u), None if cost is None or c is None else cost + c)
+    return out
+
+
+def history(st):
+    now = datetime.now(timezone.utc)
+    totals = turn_totals(st)
+    turns = sorted(totals)[-10:]
+    if not turns:
+        return "### 🕘 Message history\n\nNo finished messages to show yet. Try again after your next message."
+    peak = max(totals[t][1] for t in turns)
+    lines = ["### 🕘 Your last messages", "",
+             "| # | Message | When | Calls | Effective | Cost |", "| ---: | :--- | :--- | ---: | ---: | ---: |"]
+    for t in turns:
+        calls, eff, cost = totals[t]
+        text, when = st.prompts[t - 1] if t - 1 < len(st.prompts) else ("", None)
+        mark = " 🔺" if eff == peak and len(turns) > 1 else ""
+        text = text or "(not recorded)"
+        lines.append(f"| {t} | {text} | {ago(when, now)} | {calls} | **{fmt(eff)}**{mark} | "
+                     f"{money(cost) if cost is not None else 'n/a'} |")
+    lines += ["", ("🔺 the most expensive of these. " if len(turns) > 1 else "")
+              + "Your current `/tokens` message is still running, so it is not listed."]
+    return "\n".join(lines)
+
+
+def setup_size(st, ctx):
+    """Tokens the chat starts with before any message: the first call's context less what came before it."""
+    return min(max(0, (st.first_ctx or 0) - (st.parts_at_first or 0)), ctx or 0)
+
+
+def composition(st, ctx):
+    """The context of the last call split into setup and estimated parts, scaled to the real size."""
+    setup = setup_size(st, ctx)
+    parts = dict(st.parts)
+    total_est = sum(parts.values())
+    conv = max(0, (ctx or 0) - setup)
+    scale = conv / total_est if total_est and conv else 0
+    rows = [("Chat setup (system prompt, tools, skill list)", setup)]
+    rows += [(k, v * scale) for k, v in parts.items()]
+    return sorted((r for r in rows if r[1] >= 1), key=lambda r: -r[1]), setup, scale
+
+
+def where(st, ctx):
+    if not ctx:
+        return "### 🧭 Where it goes\n\nNothing to show yet."
+    rows, _, scale = composition(st, ctx)
+    model = main_model(st)
+    read_price = PRICES[model][3] if model else None
+    lines = ["### 🧭 What every call re-reads", "",
+             f"Each model call re-reads the whole context: **{fmt(ctx)}** tokens now"
+             + (f", about **{money(ctx * read_price / 1e6)}** per call at cache-read prices." if read_price else "."), "",
+             "| Part of the context | Tokens | Share |", "| :--- | ---: | :--- |"]
+    shown = rows[:8]
+    rest = sum(v for _, v in rows[8:])
+    if rest:
+        shown.append(("Everything else", rest))
+    for name, v in shown:
+        share = 100 * v / ctx
+        lines.append(f"| {name} | {fmt(v)} | {'▰' * max(1, round(share / 10)) if share >= 1 else ''} {pct_text(v, ctx)} |")
+    big = sorted(st.items, key=lambda it: -it[1])[:3]
+    if big and scale:
+        lines += ["", "**Biggest single items:** " + "; ".join(f"{n} ({fmt(v * scale)})" for n, v in big)]
+    lines += ["", "_Parts are estimated from the text and image sizes in this chat and scaled to the real context size._"]
+    return "\n".join(lines)
+
+
+def health_info(st, ctx):
+    setup = setup_size(st, ctx)
+    grown = max(0, (ctx or 0) - setup)
+    if grown < 100_000:
+        level, label = "🟢", "Light"
+    elif grown < 250_000:
+        level, label = "🟡", "Getting heavy"
+    else:
+        level, label = "🔴", "Heavy"
+    return level, label, setup, grown
+
+
+def cache_ttl(st):
+    """Minutes the prompt cache lives: 60 when recent writes used the 1-hour cache, else 5."""
+    recent = sorted(st.call_time.items(), key=lambda kv: kv[1] or datetime.min.replace(tzinfo=timezone.utc))[-20:]
+    for key, _ in reversed(recent):
+        u = st.calls.get(key)
+        if u and u["cache_creation_input_tokens"]:
+            return 60 if u["cache_1h"] else 5
+    return 60
+
+
+def health(st, ctx):
+    if not ctx:
+        return "### 🩺 Chat health\n\nNothing to show yet."
+    level, label, setup, grown = health_info(st, ctx)
+    model = main_model(st)
+    totals = turn_totals(st)
+    recent = [totals[t][1] for t in sorted(totals)[-3:]]
+    lines = ["### 🩺 Chat health", "", f"**{level} {label}**", "",
+             f"- Context now: **{fmt(ctx)}** tokens ({fmt(setup)} chat setup + **{fmt(grown)}** from this conversation)"]
+    if recent:
+        lines.append(f"- Your recent messages cost about **{fmt(sum(recent) / len(recent))}** effective tokens each")
+    ttl = cache_ttl(st)
+    if model:
+        p_in, p_w5, p_w1h, p_read, _ = PRICES[model]
+        warm = ctx * p_read / 1e6
+        cold = ctx * (p_w1h if ttl == 60 else p_w5) / 1e6
+        lines.append(f"- Every call re-reads it: about **{money(warm)}** while the cache is warm")
+        lines += ["", f"**⏱️ Cache timer:** the cache lasts about **{ttl} minutes** after each reply. "
+                  f"Pause longer and your next message writes the whole context again: about **{money(cold)}** "
+                  f"instead of {money(warm)} for that first call."]
+    lines.append("")
+    if level == "🔴":
+        lines.append("**Advice:** start a new chat. Send `/tokens handoff` first to get a short note to paste there.")
+    elif level == "🟡":
+        lines.append("**Advice:** fine for now. When you switch to a new topic, start a new chat (`/tokens handoff` helps).")
+    else:
+        lines.append("**Advice:** nothing to do.")
+    return "\n".join(lines)
+
+
+def tips(st, rows, effective, ctx):
+    found = []
+    if ctx:
+        level, _, _, grown = health_info(st, ctx)
+        if level != "🟢":
+            found.append(("Start a new chat for the next topic",
+                          f"this conversation adds {fmt(grown)} tokens that every call re-reads. `/tokens handoff` writes a note to carry over."))
+        comp, _, _ = composition(st, ctx)
+        shots = sum(v for n, v in comp if n == "Screenshots and images from tools")
+        if shots / ctx > 0.10:
+            found.append(("Read pages as text instead of screenshots",
+                          f"tool screenshots fill {pct_text(shots, ctx)} of the context ({fmt(shots)}); page text is usually far smaller."))
+        big = [v for _, v in st.items if v > 8_000]
+        if big:
+            found.append(("Ask for trimmed tool output",
+                          f"{len(big)} tool result(s) were over 8k tokens each; asking for filtered or shortened output keeps them out of the context."))
+    reads, writes = rows[1][1], rows[2][1]
+    if writes and reads / max(1, reads + writes + rows[0][1]) < 0.85 and len(st.calls) > 5:
+        found.append(("Keep pauses under the cache timer",
+                      f"only {hit_rate(rows)} of input came from the cache; after a long pause the whole context is written again at 2x."))
+    if st.cards >= 3:
+        found.append(("Use `/tokens lite` for quick checks",
+                      f"{st.cards} cards were drawn in this chat; each card costs far more than the text view."))
+    out_tokens = rows[3][1]
+    thinking = sum(u["thinking_tokens"] for u in st.calls.values())
+    if out_tokens and thinking / out_tokens > 0.5 and out_tokens > 5_000:
+        found.append(("Lower the effort setting for simple chats",
+                      f"thinking is {pct_text(thinking, out_tokens)} of all output ({fmt(thinking)} tokens)."))
+    totals = turn_totals(st)
+    if totals:
+        avg_calls = sum(c for c, _, _ in totals.values()) / len(totals)
+        if avg_calls > 10:
+            found.append(("Give fuller instructions up front",
+                          f"messages take {avg_calls:.0f} model calls on average; each call re-reads the context."))
+    if effective and rows[3][1] * 5 / effective > 0.25:
+        found.append(("Ask for shorter answers",
+                      f"Claude's output is {pct_text(rows[3][1] * 5, effective)} of the effective total (output counts 5x)."))
+    lines = ["### 💡 Ways to spend less", ""]
+    if not found:
+        lines.append("Nothing stands out: this chat is already lean.")
+    for i, (title, why) in enumerate(found[:5], 1):
+        lines.append(f"{i}. **{title}**: {why}")
+    return "\n".join(lines)
+
+
+def compare(st):
+    current = main_model(st)
+    options = ["fable-5-1", "opus-5-5", "sonnet-5-5", "haiku-5-5", "opus-5", "sonnet-4-6"]
+    if current and current not in options:
+        options.insert(0, current)
+    costs = []
+    for m in options:
+        total = 0.0
+        for u in st.calls.values():
+            total += call_cost(m, u) or 0
+        costs.append((m, total))
+    base = next((c for m, c in costs if m == current), None)
+    lines = ["### ⚖️ This chat on other models", "",
+             "| Model | Est. cost | vs now |", "| :--- | ---: | ---: |"]
+    for m, c in sorted(costs, key=lambda mc: -mc[1]):
+        name = MODEL_NAMES.get(m, m)
+        if m == current:
+            name = f"**{name} (used)**"
+        vs = "" if not base or m == current else (f"{c / base:.1f}x" if c >= base else f"{100 * (1 - c / base):.0f}% less")
+        lines.append(f"| {name} | {money(c)} | {vs} |")
+    lines += ["", "_Same token counts priced at each model's list prices. Real counts and answer quality differ by model._"]
     return "\n".join(lines)
 
 
 def main():
     arg = " ".join(sys.argv[1:]).strip().lower() or "lite"
-    if arg not in ("detailed", "summary", "lite"):
+    if arg not in ("detailed", "summary", "lite", "history", "where", "health", "tips", "compare"):
         print(HELP if arg == "help" else f"Unknown option.\n\n{HELP}")
         return
 
@@ -480,9 +876,12 @@ def main():
     effective = sum(n * w for _, n, w, _ in rows)
     ctx = None
     if st.last:
-        u = st.last
-        ctx = u["input_tokens"] + u["cache_read_input_tokens"] + u["cache_creation_input_tokens"]
-    if arg == "detailed":
+        ctx = context_of(st.last)
+    views = {"history": lambda: history(st), "where": lambda: where(st, ctx), "health": lambda: health(st, ctx),
+             "tips": lambda: tips(st, rows, effective, ctx), "compare": lambda: compare(st)}
+    if arg in views:
+        print(views[arg]())
+    elif arg == "detailed":
         print(card_detailed(st, rows, effective, ctx))
     elif arg == "summary":
         print(card_summary(st, rows, effective, ctx))
