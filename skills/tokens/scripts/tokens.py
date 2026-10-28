@@ -298,11 +298,14 @@ class Stats:
                 # block), each repeating the same usage: count it once.
                 key = str(msg.get("id") or row.get("uuid") or len(self.calls))
                 usage = clean_usage(usage)
+                if key not in self.calls and not any(usage[k] for k in KEYS):
+                    continue
                 if key not in self.calls:
                     self.call_time[key] = parse_time(row.get("timestamp"))
-                    if main and not row.get("isSidechain") and self.first_key is None:
-                        self.first_key = key
-                        self.parts_at_first = sum(self.parts.values())
+                # The app can make helper calls that report no tokens: the chat starts at the first real one.
+                if main and not row.get("isSidechain") and self.first_key is None and context_of(usage) > 0:
+                    self.first_key = key
+                    self.parts_at_first = sum(self.parts.values())
                 self.calls[key] = usage
                 self.models[key] = str(msg.get("model") or "")
                 self.turn_of.setdefault(key, self.turn)
