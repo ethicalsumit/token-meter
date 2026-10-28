@@ -1,6 +1,6 @@
 ---
 name: tokens
-description: Show this chat's token usage. Use whenever the user sends /tokens, "/tokens summary", "/tokens lite" or "/tokens help", or asks how many tokens this chat has used.
+description: Show this chat's token usage and how to spend less. Use whenever the user sends /tokens or /tokens with summary, lite, history, where, health, tips, compare, handoff or help, or asks how many tokens this chat has used.
 ---
 
 # /tokens
@@ -14,9 +14,15 @@ What to run depends on what the user wrote after `/tokens`. Run exactly one of t
 | `/tokens` | `python3 <script> detailed` | a card |
 | `/tokens summary` | `python3 <script> summary` | a card |
 | `/tokens lite` | `python3 <script> lite` | text |
+| `/tokens history` | `python3 <script> history` | text |
+| `/tokens where` | `python3 <script> where` | text |
+| `/tokens health` | `python3 <script> health` | text |
+| `/tokens tips` | `python3 <script> tips` | text |
+| `/tokens compare` | `python3 <script> compare` | text |
+| `/tokens handoff` | no command; see Handoff below | text |
 | `/tokens help`, or anything else after `/tokens` | `python3 <script> help` | text |
 
-## Text (lite and help)
+## Text (lite, history, where, health, tips, compare and help)
 
 Reply with the command's output exactly as printed, as plain Markdown so it renders: not inside a code block, and nothing else: no intro, no explanation, no follow-up question.
 
@@ -29,5 +35,17 @@ Reply with the command's output exactly as printed, as plain Markdown so it rend
    - Only if `show_widget` refuses because `read_me` has not been called, call `read_me` with modules `mockup`, then call `show_widget` again with the same card.
    - Then reply with exactly one line and nothing else: the card's effective total, written as `**<total>** effective tokens` (for example `**54.4k** effective tokens`). No explanation of the card, the numbers or their cost.
 2. Otherwise, run `python3 <script> lite` and reply with its output exactly as printed, as plain Markdown, and nothing else.
+
+## Handoff (/tokens handoff)
+
+Run no command. Write a note the user can paste as the first message of a new chat, so the work carries on without this chat's long context. Base it only on this conversation. Put it in one code block, under 150 words, with these labelled lines, as plain text (no Markdown inside the block):
+
+- Goal: what the user is trying to get done
+- Done so far: the key results and decisions, briefly
+- Current state: where things stand now, with exact names of files, links or settings that matter
+- Next step: what to do next
+- Preferences: the user's stated wishes for how the work is done, if any
+
+Leave out passwords, keys, tokens, personal identifiers and anything the user marked private. After the code block add one line: `Paste this into a new chat to continue.`
 
 If the script prints `Couldn't read the token count`, reply with that one line and nothing else.
